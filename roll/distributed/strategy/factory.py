@@ -21,6 +21,8 @@ def create_strategy(worker: Worker, sync_wrapper: bool = False) -> Union[Inferen
         from roll.distributed.strategy.vllm_strategy import VllmStrategy as strategy_cls
     elif strategy_name == "sglang":
         from roll.distributed.strategy.sglang_strategy import SgLangStrategy as strategy_cls
+    elif strategy_name == "rtp":
+        from roll.distributed.strategy.rtp_strategy import RtpStrategy as strategy_cls
     elif strategy_name == "megatron_infer":
         from roll.distributed.strategy.megatron_strategy import MegatronInferStrategy as strategy_cls
     elif strategy_name == "megatron_train":

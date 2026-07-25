@@ -24,6 +24,7 @@ class StrategyArguments:
         "hf_infer",
         "vllm",
         "sglang",
+        "rtp",
         "megatron_infer",
         "megatron_train",
         "fsdp2_train",
@@ -31,7 +32,7 @@ class StrategyArguments:
     ] = field(
         default="fsdp2_train",
         metadata={
-            "help": "The name of the strategy. Options: 'hf_infer', 'vllm', 'sglang', "
+            "help": "The name of the strategy. Options: 'hf_infer', 'vllm', 'sglang', 'rtp', "
             "'megatron_infer', 'megatron_train', 'fsdp2_train', 'fsdp2_infer'."
         },
     )
@@ -275,7 +276,7 @@ class WorkerConfig:
         self.offload_nccl = False
         logger.info(f"force set offload_nccl=False.")
         if self.strategy_args is not None:
-            if self.strategy_args.strategy_name not in ["hf_infer", "vllm", "sglang"] and self.num_gpus_per_worker > 1:
+            if self.strategy_args.strategy_name not in ["hf_infer", "vllm", "sglang", "rtp"] and self.num_gpus_per_worker > 1:
                 logger.info(
                     f"strategy_name={self.strategy_args.strategy_name}, force set num_gpus_per_worker={self.num_gpus_per_worker} to 1."
                 )
