@@ -57,6 +57,7 @@ class RtpStrategy(InferenceStrategy):
         strategy_config = self.worker_config.strategy_args.strategy_config
         max_total_tokens = strategy_config.get("max_total_tokens", 2048)
         tokens_per_block = strategy_config.get("tokens_per_block", 64)
+        kv_cache_mem_mb = strategy_config.get("kv_cache_mem_mb", 4096)
 
         logger.info(f"Loading model from {model_path} with rtp-llm engine (continuous batching)")
 
@@ -73,7 +74,7 @@ class RtpStrategy(InferenceStrategy):
             py_env_configs.model_args.ckpt_path = model_path_resolved
             py_env_configs.model_args.max_seq_len = max_total_tokens
             py_env_configs.kv_cache_config.seq_size_per_block = tokens_per_block
-            py_env_configs.kv_cache_config.kv_cache_mem_mb = 4096
+            py_env_configs.kv_cache_config.kv_cache_mem_mb = kv_cache_mem_mb
             if not py_env_configs.model_args.tokenizer_path:
                 py_env_configs.model_args.tokenizer_path = model_path_resolved
 
@@ -338,13 +339,12 @@ class RtpStrategy(InferenceStrategy):
     async def setup_collective_group(
         self, master_address, master_port, rank_offset, world_size, group_name, backend=None
     ):
-        logger.info(f"setup_collective_group {group_name=} rank={rank_offset + 1} world_size={world_size}")
+        logger.info(f"setup_collective_group {group_name=} rank={rank_offset} world_size={world_size}")
         backend = backend if backend is not None else current_platform.communication_backend
         collective.init_collective_group(
-            world_size, rank_offset + 1, backend=backend, group_name=group_name,
+            world_size, rank_offset, backend=backend, group_name=group_name,
             master_addr=master_address, master_port=master_port,
         )
-        collective.allreduce(torch.zeros(1).to(current_platform.device_type), group_name=group_name)
 
     async def broadcast_parameter(self, names, dtypes, shapes, group_name, is_lora=False):
         assert not is_lora, "LoRA not supported in rtp strategy"
