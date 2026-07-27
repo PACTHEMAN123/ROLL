@@ -1,9 +1,9 @@
+import asyncio
 import sys
-import math
+import time
 from typing import Dict, List, Optional
 
 import torch
-import torch.distributed as dist
 from torch.nn.utils.rnn import pad_sequence
 from transformers import set_seed
 
@@ -22,40 +22,206 @@ logger = get_logger()
 
 
 class RtpStrategy(InferenceStrategy):
+    """RTP-LLM inference strategy with continuous batching via the C++ engine."""
+
     strategy_name = "rtp"
 
     def __init__(self, worker: Worker):
         super().__init__(worker)
-        self.auto_model = None
+        self.model = None
+        self.rtp_op = None
+        self.rpc_client = None
+        self.token_processor = None
         self._weight_buffer: Dict[str, torch.Tensor] = {}
         self.is_model_in_gpu = False
         self._device = "cuda"
+        self._request_id_counter = 0
+
+    def _next_request_id(self) -> int:
+        rid = self._request_id_counter
+        self._request_id_counter += 1
+        return rid
 
     async def initialize(self, model_provider):
         set_seed(seed=self.worker.pipeline_config.seed)
 
-        from rtp_llm.models_py.standalone.auto_model import AutoModel
+        from rtp_llm.config.engine_config import EngineConfig
+        from rtp_llm.config.py_config_modules import PyEnvConfigs
+        from rtp_llm.cpp.model_rpc.model_rpc_client import ModelRpcClient
+        from rtp_llm.frontend.token_processor import TokenProcessor
+        from rtp_llm.model_factory import ModelFactory
+        from rtp_llm.ops.rtp_llm.rtp_llm_op import RtpLLMOp
+        from rtp_llm.tools.api.hf_model_helper import get_model_info_from_hf
 
         model_path = self.worker_config.model_args.model_name_or_path
         strategy_config = self.worker_config.strategy_args.strategy_config
         max_total_tokens = strategy_config.get("max_total_tokens", 2048)
         tokens_per_block = strategy_config.get("tokens_per_block", 64)
 
-        logger.info(f"Loading model from {model_path} with rtp-llm AutoModel")
+        logger.info(f"Loading model from {model_path} with rtp-llm engine (continuous batching)")
+
+        # rtp-llm's config parser reads sys.argv during PyEnvConfigs() and
+        # EngineConfig.create(); replace it before any config construction.
         saved_argv = sys.argv
         sys.argv = ["rtp_strategy"]
         try:
-            self.auto_model = AutoModel.from_pretrained(
-                model_path,
-                max_total_tokens=max_total_tokens,
-                tokens_per_block=tokens_per_block,
+            py_env_configs = PyEnvConfigs()
+
+            model_path_resolved, model_type = get_model_info_from_hf(model_path, None)
+
+            py_env_configs.model_args.model_type = model_type
+            py_env_configs.model_args.ckpt_path = model_path_resolved
+            py_env_configs.model_args.max_seq_len = max_total_tokens
+            py_env_configs.kv_cache_config.seq_size_per_block = tokens_per_block
+            py_env_configs.kv_cache_config.kv_cache_mem_mb = 4096
+            if not py_env_configs.model_args.tokenizer_path:
+                py_env_configs.model_args.tokenizer_path = model_path_resolved
+
+            engine_config = EngineConfig.create(py_env_configs, nccl_comm_config=None)
+
+            model_config = ModelFactory.create_model_config(
+                model_args=py_env_configs.model_args,
+                lora_config=py_env_configs.lora_config,
+                kv_cache_config=engine_config.kv_cache_config,
+                profiling_debug_logging_config=engine_config.profiling_debug_logging_config,
+                generate_env_config=py_env_configs.generate_env_config,
+                embedding_config=py_env_configs.embedding_config,
+                quantization_config=py_env_configs.quantization_config,
+                render_config=py_env_configs.render_config,
+                vit_config=py_env_configs.vit_config,
             )
+
+            ModelFactory.update_engine_config_from_model_config(
+                engine_config=engine_config,
+                model_config=model_config,
+            )
+
+            self.model = ModelFactory._create_model(
+                model_config=model_config,
+                engine_config=engine_config,
+                vit_config=py_env_configs.vit_config,
+                merge_lora=False,
+            )
+            self.model.load()
+
+            self.token_processor = TokenProcessor(
+                self.model.tokenizer,
+                self.model.model_config.special_tokens,
+            )
+
+            self.rtp_op = RtpLLMOp(
+                engine_config=engine_config,
+                model=self.model,
+                propose_model=None,
+                token_processor=self.token_processor,
+                mm_process_engine=None,
+            )
+            self.rtp_op.start()
         finally:
             sys.argv = saved_argv
-        self.tokenizer = self.auto_model.tokenizer
-        self._device = self.auto_model.device
+
+        rpc_port = engine_config.server_config.rpc_server_port
+        self.rpc_client = ModelRpcClient(
+            addresses=[f"127.0.0.1:{rpc_port}"],
+            client_config={},
+        )
+
+        await self._wait_engine_ready()
+
+        self.tokenizer = self.model.tokenizer
+        self._device = "cuda"
         self.is_model_in_gpu = True
-        logger.info(f"RtpStrategy initialized on device={self._device}")
+        logger.info(
+            f"RtpStrategy initialized with engine on device={self._device}, rpc_port={rpc_port}"
+        )
+
+    async def _wait_engine_ready(self, timeout_s: int = 120):
+        from rtp_llm.config.generate_config import GenerateConfig
+        from rtp_llm.utils.base_model_datatypes import GenerateInput
+
+        eos_id = self.model.tokenizer.eos_token_id
+        if eos_id is None:
+            eos_id = 0
+
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            try:
+                test_input = GenerateInput(
+                    request_id=self._next_request_id(),
+                    token_ids=torch.tensor([eos_id], dtype=torch.int32),
+                    mm_inputs=[],
+                    generate_config=GenerateConfig(
+                        max_new_tokens=1,
+                        num_return_sequences=1,
+                        return_output_ids=True,
+                        stop_words_list=[[eos_id]],
+                    ),
+                )
+                await self.rpc_client.batch_enqueue([test_input])
+                logger.info("Engine gRPC server is ready")
+                return
+            except Exception as e:
+                logger.debug(f"Engine not ready, retrying: {e}")
+                await asyncio.sleep(0.5)
+        raise RuntimeError(f"Engine did not become ready within {timeout_s}s")
+
+    def _build_generate_config(
+        self,
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        stop_token_ids: list,
+    ):
+        from rtp_llm.config.generate_config import GenerateConfig
+
+        stop_words_list = [[tid] for tid in stop_token_ids] if stop_token_ids else []
+        do_sample = temperature > 0
+        if top_k is not None and top_k < 0:
+            top_k = 0
+
+        return GenerateConfig(
+            max_new_tokens=max_new_tokens,
+            temperature=temperature if do_sample else 1.0,
+            top_p=top_p,
+            top_k=top_k,
+            num_return_sequences=1,
+            do_sample=do_sample,
+            stop_words_list=stop_words_list,
+            return_output_ids=True,
+            return_incremental=False,
+            is_streaming=False,
+        )
+
+    def _build_generate_input(self, prompt_ids: list, gen_config) -> "GenerateInput":
+        from rtp_llm.utils.base_model_datatypes import GenerateInput
+
+        token_ids = torch.tensor(prompt_ids, dtype=torch.int32)
+        return GenerateInput(
+            request_id=self._next_request_id(),
+            token_ids=token_ids,
+            mm_inputs=[],
+            generate_config=gen_config,
+        )
+
+    def _extract_output_ids(self, result) -> list:
+        if not result.generate_outputs:
+            return []
+        output = result.generate_outputs[0]
+        output_ids = output.output_ids
+        if output_ids is None:
+            return []
+        if isinstance(output_ids, torch.Tensor):
+            output_ids = output_ids.cpu().tolist()
+        elif not isinstance(output_ids, list):
+            import numpy as np
+            if isinstance(output_ids, np.ndarray):
+                output_ids = output_ids.reshape(-1).tolist()
+            else:
+                output_ids = list(output_ids)
+        if output_ids and isinstance(output_ids[0], list):
+            output_ids = output_ids[0]
+        return [int(x) for x in output_ids]
 
     async def generate(self, batch: DataProto, generation_config: Dict) -> torch.Tensor:
         input_ids = batch.batch["input_ids"]
@@ -68,22 +234,39 @@ class RtpStrategy(InferenceStrategy):
         if isinstance(stop_token_ids, int):
             stop_token_ids = [stop_token_ids]
 
-        sampling_params = {
-            "temperature": generation_config.get("temperature", 1.0),
-            "top_p": generation_config.get("top_p", 1.0),
-            "top_k": generation_config.get("top_k", 0),
-        }
+        temperature = generation_config.get("temperature", 1.0)
+        top_p = generation_config.get("top_p", 1.0)
+        top_k = generation_config.get("top_k", 0)
 
-        all_output_ids = []
+        gen_config = self._build_generate_config(
+            max_new_tokens, temperature, top_p, top_k, stop_token_ids
+        )
+
+        inputs = []
         for prompt_ids in prompts:
             for _ in range(n):
-                output_ids = self._generate_with_sampling(
-                    prompt_ids, max_new_tokens, sampling_params, stop_token_ids
-                )
-                all_output_ids.append(torch.tensor(output_ids, device=input_ids.device))
+                inputs.append(self._build_generate_input(prompt_ids, gen_config))
+
+        try:
+            results = await self.rpc_client.batch_enqueue(inputs)
+        except Exception as e:
+            msg = f"batch_enqueue failed: {type(e).__name__}: {e}"
+            if hasattr(e, "exception_type"):
+                msg += f" (exception_type={e.exception_type})"
+            logger.error(msg)
+            raise RuntimeError(msg) from None
+
+        all_output_ids = []
+        for result in results:
+            output_ids = self._extract_output_ids(result)
+            all_output_ids.append(torch.tensor(output_ids, device=input_ids.device))
+
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id or 0
 
         output_ids_tensor = pad_sequence(
-            all_output_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
+            all_output_ids, batch_first=True, padding_value=pad_token_id
         )
         output = concatenate_input_and_output(
             input_ids=input_ids, output_ids=output_ids_tensor, num_return_sequences=n
@@ -100,20 +283,34 @@ class RtpStrategy(InferenceStrategy):
             stop_token_ids = [stop_token_ids]
         n = sp.get("n", 1)
 
-        sampling_params = {
-            "temperature": sp.get("temperature", 1.0),
-            "top_p": sp.get("top_p", 1.0),
-            "top_k": sp.get("top_k", 0),
-        }
+        temperature = sp.get("temperature", 1.0)
+        top_p = sp.get("top_p", 1.0)
+        top_k = sp.get("top_k", 0)
+
+        gen_config = self._build_generate_config(
+            max_new_tokens, temperature, top_p, top_k, stop_token_ids
+        )
+
+        inputs = []
+        for _ in range(n):
+            inputs.append(self._build_generate_input(input_ids, gen_config))
+
+        try:
+            results = await self.rpc_client.batch_enqueue(inputs)
+        except Exception as e:
+            msg = f"batch_enqueue failed: {type(e).__name__}: {e}"
+            if hasattr(e, "exception_type"):
+                msg += f" (exception_type={e.exception_type})"
+            logger.error(msg)
+            raise RuntimeError(msg) from None
 
         all_output_ids = []
         finish_reasons = []
-        for _ in range(n):
-            output_ids = self._generate_with_sampling(
-                input_ids, max_new_tokens, sampling_params, stop_token_ids
-            )
+        for result in results:
+            output_ids = self._extract_output_ids(result)
             all_output_ids.append(output_ids)
-            finish_reasons.append("stop")
+            finished = bool(result.generate_outputs and result.generate_outputs[0].finished)
+            finish_reasons.append("stop" if finished else "length")
 
         return {
             "output_token_ids": all_output_ids,
@@ -124,90 +321,18 @@ class RtpStrategy(InferenceStrategy):
     async def abort_requests(self, request_ids=None):
         pass
 
-    def _generate_with_sampling(
-        self, input_ids: list, max_new_tokens: int, sampling_params: dict, stop_token_ids: list = None
-    ) -> list:
-        from rtp_llm.ops.compute_ops import PyModelInputs
-
-        am = self.auto_model
-        output_ids = []
-        input_length = len(input_ids)
-        input_ids_tensor = torch.tensor(input_ids, dtype=torch.int32, device=am.device)
-
-        # Prefill
-        attn_inputs = am._prepare_prefill_attention_inputs(input_length)
-        model_inputs = PyModelInputs(input_ids=input_ids_tensor, attention_inputs=attn_inputs)
-        model_outputs = am.model.forward(model_inputs)
-        next_token_id = self._sample_next_token(model_outputs, sampling_params)
-        next_token_cpu = next_token_id.cpu().item()
-
-        if stop_token_ids and next_token_cpu in stop_token_ids:
-            return output_ids
-        output_ids.append(next_token_cpu)
-
-        # Decode loop
-        gen_tokens = 1
-        while gen_tokens < max_new_tokens:
-            attn_inputs = am._prepare_decode_attention_inputs(attn_inputs, input_length + gen_tokens)
-            model_inputs = PyModelInputs(input_ids=next_token_id, attention_inputs=attn_inputs)
-            model_outputs = am.model.forward(model_inputs)
-            next_token_id = self._sample_next_token(model_outputs, sampling_params)
-            next_token_cpu = next_token_id.cpu().item()
-            gen_tokens += 1
-
-            if stop_token_ids and next_token_cpu in stop_token_ids:
-                break
-            output_ids.append(next_token_cpu)
-
-        return output_ids
-
-    def _sample_next_token(self, model_outputs, sampling_params: dict) -> torch.Tensor:
-        am = self.auto_model
-        hidden_states = model_outputs.hidden_states[-1:, :]
-        logits = torch.matmul(
-            hidden_states.to(am.lm_head_weight.dtype), am.lm_head_weight.t()
-        ).to(torch.float32)
-
-        temperature = sampling_params.get("temperature", 1.0)
-        if temperature == 0:
-            return torch.argmax(logits, dim=-1)
-
-        logits = logits / temperature
-
-        top_k = sampling_params.get("top_k", 0)
-        if top_k and top_k > 0:
-            top_k = min(top_k, logits.size(-1))
-            topk_values, _ = torch.topk(logits, top_k, dim=-1)
-            logits[logits < topk_values[..., -1:]] = float("-inf")
-
-        top_p = sampling_params.get("top_p", 1.0)
-        if top_p < 1.0:
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
-            cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-            sorted_indices_to_remove = cumulative_probs > top_p
-            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-            sorted_indices_to_remove[..., 0] = False
-            indices_to_remove = sorted_indices_to_remove.scatter(
-                1, sorted_indices, sorted_indices_to_remove
-            )
-            logits[indices_to_remove] = float("-inf")
-
-        probs = torch.softmax(logits, dim=-1)
-        next_token_id = torch.multinomial(probs, num_samples=1).squeeze(-1)
-        return next_token_id
-
     async def load_states(self, *args, **kwargs):
         if not self.is_model_in_gpu:
-            self.auto_model.model.to(self._device)
             self.is_model_in_gpu = True
-            logger.info("RtpStrategy model loaded to GPU")
+            logger.info("RtpStrategy load_states (engine resident, no transfer needed)")
 
     async def offload_states(self, include=None, non_blocking=False):
         if include is None or OffloadStateType.model_params in include:
             if self.is_model_in_gpu and self.worker.pipeline_config.is_actor_infer_colocated:
-                self.auto_model.model.to("cpu")
-                self.is_model_in_gpu = False
-                logger.info("RtpStrategy model offloaded to CPU")
+                logger.info(
+                    "RtpStrategy offload_states: engine stays resident on GPU "
+                    "(pause/restart not yet exposed via pybind)"
+                )
         clear_memory()
 
     async def setup_collective_group(
@@ -254,7 +379,7 @@ class RtpStrategy(InferenceStrategy):
             return
 
         logger.info(f"Applying {len(self._weight_buffer)} weight updates to model")
-        self.auto_model.load_weights(self._weight_buffer)
+        self.model.weight_manager.load_weights(self._weight_buffer)
         logger.info("In-place weight update succeeded")
         self._weight_buffer.clear()
         clear_memory()
