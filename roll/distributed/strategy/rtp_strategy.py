@@ -1,8 +1,5 @@
-import os
 import sys
 import math
-import shutil
-import tempfile
 from typing import Dict, List, Optional
 
 import torch
@@ -257,64 +254,10 @@ class RtpStrategy(InferenceStrategy):
             return
 
         logger.info(f"Applying {len(self._weight_buffer)} weight updates to model")
-
-        try:
-            self._update_weights_direct()
-            logger.info("Direct weight update succeeded")
-        except Exception as e:
-            logger.warning(f"Direct weight update failed: {e}")
-            self._update_weights_via_checkpoint()
-
+        self.auto_model.load_weights(self._weight_buffer)
+        logger.info("In-place weight update succeeded")
         self._weight_buffer.clear()
         clear_memory()
-
-    def _update_weights_direct(self):
-        weight = self.auto_model.model.weight
-        updated = 0
-        for name, new_tensor in self._weight_buffer.items():
-            try:
-                current = weight.get_global_weight(name)
-                current.data.copy_(new_tensor.to(current.dtype).to(current.device))
-                updated += 1
-            except Exception as e:
-                logger.debug(f"Failed to update weight '{name}' directly: {e}")
-                raise
-        logger.info(f"Updated {updated}/{len(self._weight_buffer)} weights directly")
-
-    def _update_weights_via_checkpoint(self):
-        from safetensors.torch import save_file
-
-        tmpdir = tempfile.mkdtemp(prefix="rtp_weight_update_")
-        try:
-            state_dict = {}
-            for name, tensor in self._weight_buffer.items():
-                state_dict[name] = tensor.cpu().contiguous()
-            save_file(state_dict, os.path.join(tmpdir, "model.safetensors"))
-
-            original_path = self.worker_config.model_args.model_name_or_path
-            for fname in os.listdir(original_path):
-                if fname.endswith((".json", ".txt", ".model")) or "token" in fname.lower():
-                    shutil.copy2(os.path.join(original_path, fname), os.path.join(tmpdir, fname))
-
-            from rtp_llm.models_py.standalone.auto_model import AutoModel
-
-            strategy_config = self.worker_config.strategy_args.strategy_config
-            logger.info(f"Reloading model from checkpoint: {tmpdir}")
-            saved_argv = sys.argv
-            sys.argv = ["rtp_strategy"]
-            try:
-                self.auto_model = AutoModel.from_pretrained(
-                    tmpdir,
-                    max_total_tokens=strategy_config.get("max_total_tokens", 2048),
-                    tokens_per_block=strategy_config.get("tokens_per_block", 64),
-                )
-            finally:
-                sys.argv = saved_argv
-            self._device = self.auto_model.device
-            self.is_model_in_gpu = True
-            logger.info("Model reloaded from checkpoint successfully")
-        finally:
-            shutil.rmtree(tmpdir, ignore_errors=True)
 
     def get_metrics(self, metric_names: Optional[List[str]] = None) -> Dict[str, float]:
         return {}
