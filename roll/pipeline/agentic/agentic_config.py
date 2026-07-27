@@ -365,7 +365,7 @@ class AgenticConfig(PPOConfig):
             and self.actor_infer.strategy_args is not None
         ):
             strategy_name = self.actor_infer.strategy_args.strategy_name
-            assert strategy_name in ["vllm", "sglang"]
+            assert strategy_name in ["vllm", "sglang", "rtp"]
             max_concurrency = max(
                 self.train_env_manager.world_size * self.train_env_manager.max_env_num_per_worker + 1,
                 self.val_env_manager.world_size * self.val_env_manager.max_env_num_per_worker + 1,

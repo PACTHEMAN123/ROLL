@@ -600,6 +600,16 @@ class RouterClient:
                 # vllm is hard coded to return logprob
                 sampling_params = create_sampling_params_for_vllm(generation_config, collect_unfinished)
                 payload["sampling_params"] = sampling_params
+            case "rtp":
+                sampling_params = dict(
+                    max_new_tokens=generation_config["max_new_tokens"],
+                    temperature=generation_config["temperature"],
+                    top_p=generation_config["top_p"],
+                    top_k=generation_config["top_k"],
+                    stop_token_ids=generation_config["eos_token_id"],
+                    n=generation_config["num_return_sequences"],
+                )
+                payload["sampling_params"] = sampling_params
             case _:
                 raise NotImplementedError(f"strategy {self.strategy_name} is not supported")
         return payload, request_id

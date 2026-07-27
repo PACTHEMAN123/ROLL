@@ -1,4 +1,5 @@
 import os
+import sys
 import math
 import shutil
 import tempfile
@@ -44,11 +45,16 @@ class RtpStrategy(InferenceStrategy):
         tokens_per_block = strategy_config.get("tokens_per_block", 64)
 
         logger.info(f"Loading model from {model_path} with rtp-llm AutoModel")
-        self.auto_model = AutoModel.from_pretrained(
-            model_path,
-            max_total_tokens=max_total_tokens,
-            tokens_per_block=tokens_per_block,
-        )
+        saved_argv = sys.argv
+        sys.argv = ["rtp_strategy"]
+        try:
+            self.auto_model = AutoModel.from_pretrained(
+                model_path,
+                max_total_tokens=max_total_tokens,
+                tokens_per_block=tokens_per_block,
+            )
+        finally:
+            sys.argv = saved_argv
         self.tokenizer = self.auto_model.tokenizer
         self._device = self.auto_model.device
         self.is_model_in_gpu = True
@@ -95,6 +101,7 @@ class RtpStrategy(InferenceStrategy):
         stop_token_ids = sp.get("stop_token_ids", [])
         if isinstance(stop_token_ids, int):
             stop_token_ids = [stop_token_ids]
+        n = sp.get("n", 1)
 
         sampling_params = {
             "temperature": sp.get("temperature", 1.0),
@@ -102,14 +109,19 @@ class RtpStrategy(InferenceStrategy):
             "top_k": sp.get("top_k", 0),
         }
 
-        output_ids = self._generate_with_sampling(
-            input_ids, max_new_tokens, sampling_params, stop_token_ids
-        )
+        all_output_ids = []
+        finish_reasons = []
+        for _ in range(n):
+            output_ids = self._generate_with_sampling(
+                input_ids, max_new_tokens, sampling_params, stop_token_ids
+            )
+            all_output_ids.append(output_ids)
+            finish_reasons.append("stop")
 
         return {
-            "output_token_ids": [output_ids],
-            "finish_reasons": ["stop"],
-            "output_logprobs": [],
+            "output_token_ids": all_output_ids,
+            "finish_reasons": finish_reasons,
+            "output_logprobs": None,
         }
 
     async def abort_requests(self, request_ids=None):
@@ -288,11 +300,16 @@ class RtpStrategy(InferenceStrategy):
 
             strategy_config = self.worker_config.strategy_args.strategy_config
             logger.info(f"Reloading model from checkpoint: {tmpdir}")
-            self.auto_model = AutoModel.from_pretrained(
-                tmpdir,
-                max_total_tokens=strategy_config.get("max_total_tokens", 2048),
-                tokens_per_block=strategy_config.get("tokens_per_block", 64),
-            )
+            saved_argv = sys.argv
+            sys.argv = ["rtp_strategy"]
+            try:
+                self.auto_model = AutoModel.from_pretrained(
+                    tmpdir,
+                    max_total_tokens=strategy_config.get("max_total_tokens", 2048),
+                    tokens_per_block=strategy_config.get("tokens_per_block", 64),
+                )
+            finally:
+                sys.argv = saved_argv
             self._device = self.auto_model.device
             self.is_model_in_gpu = True
             logger.info("Model reloaded from checkpoint successfully")

@@ -387,7 +387,7 @@ class BaseConfig(ScheduleConfig):
 
         if hasattr(self, 'actor_infer') and isinstance(self.actor_infer, WorkerConfig) and self.actor_infer.strategy_args is not None:
             strategy_name = self.actor_infer.strategy_args.strategy_name
-            assert strategy_name in ["vllm", "sglang"]
+            assert strategy_name in ["vllm", "sglang", "rtp"]
             # Use max_running_requests+1 to reserve extra one for abort_requests.
             # 1000 is ray_constants.DEFAULT_MAX_CONCURRENCY_ASYNC.
             max_concurrency = max(self.max_running_requests + 1, 1000)
